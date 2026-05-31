@@ -1,5 +1,7 @@
 # Kokoro TTS Audiobook Generator
 
+**Do not use Python > 3.12**
+
 A production-ready Python pipeline that converts large text documents into high-quality MP3 audiobooks using the Kokoro text-to-speech model. Features intelligent text chunking, GPU acceleration with CPU fallback, and comprehensive error recovery for reliable processing of books, articles, and long-form content.
 
 ## Features
