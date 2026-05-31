@@ -13,10 +13,13 @@ Stephen Genusa - https://www.github.com/StephenGenusa
 import argparse
 import logging
 import re
+import shutil
 import sys
 import tempfile
+import uuid
 import wave
 from pathlib import Path
+import subprocess
 from typing import List, Tuple, Union
 
 import numpy as np
@@ -24,7 +27,6 @@ import torch
 from pydub import AudioSegment
 
 from kokoro import KModel, KPipeline
-
 
 class TextProcessor:
     """
@@ -574,41 +576,25 @@ class AudioProcessor:
         self.silence_samples = int(silence_duration * sample_rate)
 
     def save_chunk_wav(
-        self, audio_data: np.ndarray, chunk_index: int, temp_dir: Path
+            self, audio_data: np.ndarray, chunk_index: int, temp_dir: Path
     ) -> Path:
         """
         Save audio chunk as numbered WAV file with robust format handling.
-
-        Args:
-            audio_data: Audio array data.
-            chunk_index: Sequential chunk number for ordering.
-            temp_dir: Temporary directory for intermediate files.
-
-        Returns:
-            Path to saved WAV file.
-
-        Raises:
-            RuntimeError: If audio data is invalid or save fails.
         """
         if audio_data is None or len(audio_data) == 0:
             raise RuntimeError(f"Invalid audio data for chunk {chunk_index}")
 
-        # Ensure audio is properly formatted for WAV output
         try:
-            # Handle different input formats and convert to int16
             if audio_data.dtype == np.float32 or audio_data.dtype == np.float64:
-                # Normalize float audio to [-1, 1] range
                 audio_normalized = np.clip(audio_data, -1.0, 1.0)
                 audio_int16 = (audio_normalized * 32767).astype(np.int16)
             elif audio_data.dtype == np.int16:
                 audio_int16 = audio_data
             else:
-                # Convert other types to float first, then to int16
                 audio_float = audio_data.astype(np.float32)
                 audio_normalized = np.clip(audio_float, -1.0, 1.0)
                 audio_int16 = (audio_normalized * 32767).astype(np.int16)
 
-            # Ensure mono audio (flatten if needed)
             if audio_int16.ndim > 1:
                 audio_int16 = audio_int16.flatten()
 
@@ -621,16 +607,14 @@ class AudioProcessor:
 
         try:
             with wave.open(str(wav_path), "wb") as wav_file:
-                wav_file.setnchannels(1)  # Mono audio
-                wav_file.setsampwidth(2)  # 16-bit samples
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
                 wav_file.setframerate(self.sample_rate)
                 wav_file.writeframes(audio_int16.tobytes())
 
-            # Validate file was created successfully
             if not wav_path.exists() or wav_path.stat().st_size == 0:
                 raise RuntimeError(f"WAV file creation failed or file is empty")
 
-            # Log detailed chunk information
             duration_seconds = len(audio_int16) / self.sample_rate
             logging.debug(
                 f"Saved chunk {chunk_index}: {wav_path.stat().st_size:,} bytes, {duration_seconds:.2f}s"
@@ -640,148 +624,87 @@ class AudioProcessor:
         except Exception as e:
             raise RuntimeError(f"Failed to save WAV file for chunk {chunk_index}: {e}")
 
-    def create_silence(self) -> np.ndarray:
+    def generate_silence_file(self, temp_dir: Path) -> Path:
         """
-        Generate silence array for chunk separation.
-
-        Returns:
-            Numpy array containing silence samples.
+        Generate a WAV file containing the configured silence duration.
         """
-        return np.zeros(self.silence_samples, dtype=np.int16)
+        silence_path = temp_dir / "silence.wav"
+        if silence_path.exists():
+            return silence_path
 
-    def concatenate_wav_files(self, wav_files: List[Path], output_path: Path) -> None:
+        silence_data = np.zeros(self.silence_samples, dtype=np.int16)
+
+        with wave.open(str(silence_path), "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(self.sample_rate)
+            wav_file.writeframes(silence_data.tobytes())
+
+        return silence_path
+
+    def concatenate_and_convert(
+            self, wav_files: List[Path], silence_path: Path, output_path: Path, bitrate: str = "128k"
+    ) -> None:
         """
-        Concatenate WAV files with silence insertion using pydub with validation.
-
-        Args:
-            wav_files: List of WAV file paths in order.
-            output_path: Final concatenated WAV output path.
-
-        Raises:
-            RuntimeError: If concatenation fails.
+        Concatenate WAV files with silence and convert directly to MP3 using ffmpeg.
         """
         if not wav_files:
             raise RuntimeError("No WAV files provided for concatenation")
 
-        # Validate all input files exist and log their sizes
-        missing_files = []
-        total_input_duration = 0
-
-        for i, wav_file in enumerate(wav_files):
-            if not wav_file.exists():
-                missing_files.append(wav_file)
-            else:
-                file_size = wav_file.stat().st_size
-                # Estimate duration from file size (rough approximation)
-                estimated_duration = file_size / (self.sample_rate * 2)  # 16-bit mono
-                total_input_duration += estimated_duration
-                logging.debug(
-                    f"Input {i}: {file_size:,} bytes, ~{estimated_duration:.1f}s"
-                )
-
-        if missing_files:
-            raise RuntimeError(f"Missing WAV files: {missing_files}")
-
-        logging.info(
-            f"Concatenating {len(wav_files)} files, estimated total: {total_input_duration:.1f}s"
-        )
+        list_path = silence_path.parent / "concat_list.txt"
 
         try:
-            # Create silence segment
-            silence_ms = int(self.silence_duration * 1000)
-            silence = AudioSegment.silent(duration=silence_ms)
+            # Write ABSOLUTE paths into the concat list to prevent ffmpeg resolution errors
+            with open(list_path, "w", encoding="utf-8") as f:
+                for i, wav_path in enumerate(wav_files):
+                    f.write(f"file '{wav_path.resolve()}'\n")
+                    if i < len(wav_files) - 1:
+                        f.write(f"file '{silence_path.resolve()}'\n")
 
-            # Load first audio segment
-            combined_audio = AudioSegment.from_wav(str(wav_files[0]))
-            first_duration = len(combined_audio) / 1000.0
-            logging.debug(
-                f"Started concatenation with {wav_files[0]} ({first_duration:.1f}s)"
+            output_path_abs = output_path.resolve()
+            list_path_abs = list_path.resolve()
+
+            command = [
+                'ffmpeg',
+                '-y',
+                '-f', 'concat',
+                '-safe', '0',  # Required when using absolute paths in concat list
+                '-i', str(list_path_abs),
+                '-c:a', 'libmp3lame',
+                '-b:a', bitrate,
+                '-q:a', '2',
+                str(output_path_abs)
+            ]
+
+            logging.info(f"Concatenating {len(wav_files)} chunks and converting to MP3...")
+
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
             )
 
-            # Concatenate remaining segments with silence
-            for i, wav_file in enumerate(wav_files[1:], 1):
-                try:
-                    audio_segment = AudioSegment.from_wav(str(wav_file))
-                    segment_duration = len(audio_segment) / 1000.0
-                    combined_audio += silence + audio_segment
+            if result.returncode != 0:
+                logging.error(f"ffmpeg command: {' '.join(command)}")
+                logging.error(f"ffmpeg output:\n{result.stderr}")
+                raise RuntimeError(f"ffmpeg concat/conversion failed with code {result.returncode}")
 
-                    logging.debug(
-                        f"Added chunk {i}/{len(wav_files) - 1} ({segment_duration:.1f}s)"
-                    )
-                except Exception as e:
-                    logging.error(f"Failed to load {wav_file}: {e}")
-                    raise RuntimeError(f"Concatenation failed at file {wav_file}: {e}")
-
-            # Export concatenated result
-            combined_audio.export(str(output_path), format="wav")
-
-            # Validate output file
-            if not output_path.exists() or output_path.stat().st_size == 0:
-                raise RuntimeError("Concatenated file was not created or is empty")
-
-            final_duration = len(combined_audio) / 1000.0
-            silence_duration = (len(wav_files) - 1) * self.silence_duration
-            expected_duration = total_input_duration + silence_duration
-
-            logging.info(
-                f"Concatenation complete: {final_duration:.1f}s (expected: ~{expected_duration:.1f}s)"
-            )
-            logging.info(
-                f"Output: {output_path} ({output_path.stat().st_size:,} bytes)"
-            )
-
-        except Exception as e:
-            if isinstance(e, RuntimeError):
-                raise
-            else:
-                raise RuntimeError(f"Audio concatenation failed: {e}")
-
-    def convert_to_mp3(
-        self, wav_path: Path, mp3_path: Path, bitrate: str = "128k"
-    ) -> None:
-        """
-        Convert WAV file to MP3 with specified quality and validation.
-
-        Args:
-            wav_path: Source WAV file path.
-            mp3_path: Destination MP3 file path.
-            bitrate: MP3 encoding bitrate.
-
-        Raises:
-            RuntimeError: If conversion fails.
-        """
-        if not wav_path.exists():
-            raise RuntimeError(f"Source WAV file does not exist: {wav_path}")
-
-        wav_size = wav_path.stat().st_size
-        logging.info(f"Converting WAV to MP3: {wav_size:,} bytes at {bitrate}")
-
-        try:
-            audio = AudioSegment.from_wav(str(wav_path))
-            duration_seconds = len(audio) / 1000.0
-
-            audio.export(
-                str(mp3_path),
-                format="mp3",
-                bitrate=bitrate,
-                parameters=["-q:a", "2"],  # High quality VBR encoding
-            )
-
-            # Validate MP3 file was created
-            if not mp3_path.exists() or mp3_path.stat().st_size == 0:
+            if not output_path_abs.exists() or output_path_abs.stat().st_size == 0:
                 raise RuntimeError("MP3 file was not created or is empty")
 
-            # Log conversion details
-            mp3_size = mp3_path.stat().st_size
-            compression_ratio = mp3_size / wav_size if wav_size > 0 else 0
+            final_size = output_path_abs.stat().st_size
+            logging.info(f"Concatenation and MP3 conversion successful: {output_path_abs} ({final_size:,} bytes)")
 
-            logging.info(f"MP3 conversion successful: {mp3_path}")
-            logging.info(
-                f"Duration: {duration_seconds:.1f}s, Size: {wav_size:,} → {mp3_size:,} bytes ({compression_ratio:.1%})"
-            )
-
+        except FileNotFoundError:
+            raise RuntimeError("ffmpeg not found. Please ensure ffmpeg is installed and in your PATH.")
+        except RuntimeError:
+            raise
         except Exception as e:
-            raise RuntimeError(f"MP3 conversion failed: {e}")
+            raise RuntimeError(f"Audio processing failed: {e}")
+        finally:
+            if list_path.exists():
+                list_path.unlink()
 
 
 class AudiobookGenerator:
@@ -794,12 +717,12 @@ class AudiobookGenerator:
     """
 
     def __init__(
-        self,
-        voice: str = "af_heart",
-        speed: float = 1.0,
-        silence_duration: float = 1.5,
-        use_gpu: bool = True,
-        mp3_bitrate: str = "128k",
+            self,
+            voice: str = "af_heart",
+            speed: float = 1.0,
+            silence_duration: float = 1.5,
+            use_gpu: bool = True,
+            mp3_bitrate: str = "128k",
     ) -> None:
         """
         Initialize audiobook generator with synthesis parameters.
@@ -844,21 +767,10 @@ class AudiobookGenerator:
         logging.info("=== END CHUNK DEBUG ===")
 
     def generate_audiobook(
-        self, input_text: str, output_path: Union[str, Path]
+            self, input_text: str, output_path: Union[str, Path]
     ) -> None:
         """
         Generate complete audiobook from input text with comprehensive validation.
-
-        Implements full pipeline: text chunking, audio synthesis, concatenation,
-        and MP3 conversion with extensive error handling, progress tracking, and
-        validation at each stage to ensure reliable processing of large documents.
-
-        Args:
-            input_text: Source text content for audiobook.
-            output_path: Final MP3 output file path.
-
-        Raises:
-            RuntimeError: If pipeline processing fails with detailed error context.
         """
         output_path = Path(output_path)
 
@@ -908,8 +820,13 @@ class AudiobookGenerator:
         # Phase 2: Audio generation with comprehensive error handling
         logging.info("=== PHASE 2: AUDIO GENERATION ===")
 
-        with tempfile.TemporaryDirectory(prefix="audiobook_") as temp_dir:
-            temp_path = Path(temp_dir)
+        # Create a local temporary directory instead of using /tmp
+        temp_path = Path.cwd() / f".audiobook_tmp_{uuid.uuid4().hex[:8]}"
+
+        try:
+            temp_path.mkdir(parents=True, exist_ok=True)
+            logging.info(f"Created temporary working directory: {temp_path}")
+
             wav_files = []
             failed_chunks = []
             successful_chunks = 0
@@ -966,8 +883,6 @@ class AudiobookGenerator:
                     logging.error(f"Failed to process chunk {i}: {e}")
                     logging.error(f"Chunk content preview: {chunk_preview}")
                     failed_chunks.append((i, str(e)))
-
-                    # Continue processing remaining chunks rather than failing completely
                     continue
 
             # Evaluate processing results
@@ -976,9 +891,7 @@ class AudiobookGenerator:
                 logging.warning(
                     f"Failed to process {len(failed_chunks)} chunks ({failure_rate:.1f}%)"
                 )
-
-                # Log details of failed chunks for debugging
-                for chunk_idx, error in failed_chunks[:5]:  # Show first 5 failures
+                for chunk_idx, error in failed_chunks[:5]:
                     logging.warning(f"Chunk {chunk_idx} failed: {error}")
 
                 if len(wav_files) == 0:
@@ -993,32 +906,33 @@ class AudiobookGenerator:
 
             # Add silence duration to total time estimate
             silence_duration = (
-                len(wav_files) - 1
-            ) * self.audio_processor.silence_duration
+                                       len(wav_files) - 1
+                               ) * self.audio_processor.silence_duration
             estimated_total_duration = total_audio_duration + silence_duration
 
             logging.info(
                 f"Audio generation complete: {len(wav_files)} chunks, {total_audio_duration:.1f}s + {silence_duration:.1f}s silence = ~{estimated_total_duration:.1f}s total"
             )
 
-            # Phase 3: Audio concatenation
-            logging.info("=== PHASE 3: AUDIO CONCATENATION ===")
+            # Phase 3 & 4: Audio concatenation and MP3 conversion
+            logging.info("=== PHASE 3: CONCATENATION & MP3 CONVERSION ===")
 
             try:
-                concatenated_wav = temp_path / "concatenated.wav"
-                self.audio_processor.concatenate_wav_files(wav_files, concatenated_wav)
-            except Exception as e:
-                raise RuntimeError(f"Audio concatenation failed: {e}")
-
-            # Phase 4: MP3 conversion
-            logging.info("=== PHASE 4: MP3 CONVERSION ===")
-
-            try:
-                self.audio_processor.convert_to_mp3(
-                    concatenated_wav, output_path, self.mp3_bitrate
+                silence_path = self.audio_processor.generate_silence_file(temp_path)
+                self.audio_processor.concatenate_and_convert(
+                    wav_files, silence_path, output_path, self.mp3_bitrate
                 )
             except Exception as e:
-                raise RuntimeError(f"MP3 conversion failed: {e}")
+                raise RuntimeError(f"Audio processing failed: {e}")
+
+        # Ensure the local temporary directory is always cleaned up
+        finally:
+            if temp_path.exists():
+                try:
+                    shutil.rmtree(temp_path)
+                    logging.info(f"Cleaned up temporary directory: {temp_path}")
+                except Exception as e:
+                    logging.warning(f"Failed to clean up temporary directory {temp_path}: {e}")
 
         # Final validation and comprehensive summary
         if not output_path.exists():
@@ -1050,17 +964,6 @@ class AudiobookGenerator:
         if failed_chunks:
             logging.info(
                 f"Note: {len(failed_chunks)} chunks failed but processing completed"
-            )
-
-        # Sanity check: warn if output seems too small
-        expected_size_mb = (
-            len(input_text) / 8000
-        )  # Rough estimate: ~8KB text per 1MB audio
-        if (
-            final_size / 1024 / 1024 < expected_size_mb * 0.1
-        ):  # Less than 10% of expected
-            logging.warning(
-                f"Output file may be truncated: {final_size / 1024 / 1024:.1f}MB vs expected ~{expected_size_mb:.1f}MB"
             )
 
 
